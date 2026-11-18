@@ -15,6 +15,8 @@ import {
   serializeTree,
 } from './gitlib.ts';
 import { Forge } from './store.ts';
+import { executeGraphQL } from './graphql.ts';
+import { handleRest } from './rest.ts';
 
 let passed = 0;
 function ok(name: string): void {
@@ -225,6 +227,80 @@ function chainForge(): { forge: Forge; ids: string[] } {
   const second = forge.createIssue(repo, { title: 'two', body: '', labels: [] });
   assert.equal(second.number, 3);
   ok('issues and pull requests share one per-repo number sequence; unknown labels refuse');
+}
+
+// ---- pagination regressions (query paths must never loop) -------------------
+{
+  // GraphQL connection: a client that follows endCursor page by page must
+  // reach hasNextPage=false quickly and see every issue exactly once.
+  const forge = new Forge();
+  const repo = forge.createRepo('adaiversen', 'paging', false);
+  for (let i = 0; i < 5; i += 1) forge.createIssue(repo, { title: `issue ${i}`, body: '' });
+  const query = 'query($after: String) { repository(owner: "adaiversen", name: "paging") { issues(first: 2, after: $after) { nodes { number } pageInfo { hasNextPage endCursor } } } }';
+  const seen: number[] = [];
+  let after: string | null = null;
+  let pages = 0;
+  for (;;) {
+    pages += 1;
+    assert.ok(pages <= 4, 'graphql connection walk did not terminate');
+    const out = executeGraphQL(forge, { query, variables: { after } }) as {
+      data: { repository: { issues: { nodes: { number: number }[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } } };
+    };
+    const conn = out.data.repository.issues;
+    for (const node of conn.nodes) seen.push(node.number);
+    if (!conn.pageInfo.hasNextPage) break;
+    assert.notEqual(conn.pageInfo.endCursor, null);
+    after = conn.pageInfo.endCursor;
+  }
+  assert.deepEqual(seen, [1, 2, 3, 4, 5]);
+  // first: 0 returns no nodes and a null endCursor: nothing for a client to
+  // follow, so it cannot spin on an empty page either.
+  const zero = executeGraphQL(forge, {
+    query: '{ repository(owner: "adaiversen", name: "paging") { issues(first: 0) { nodes { number } pageInfo { endCursor } } } }',
+  }) as { data: { repository: { issues: { nodes: unknown[]; pageInfo: { endCursor: string | null } } } } };
+  assert.deepEqual(zero.data.repository.issues.nodes, []);
+  assert.equal(zero.data.repository.issues.pageInfo.endCursor, null);
+  ok('graphql connection pagination terminates; first:0 gives a client nothing to follow');
+}
+{
+  // REST commit listing: page through a history with per_page and confirm
+  // the walk ends (a short final page, no Link header) with each commit once,
+  // and that a page far past the end is empty instead of repeating page one.
+  const { forge, ids } = chainForge();
+  const call = (qs: string): { status: number; headers: Record<string, string>; body: { sha: string }[] } => {
+    const url = new URL(`http://forge.invalid/api/v3/repos/adaiversen/history/commits?${qs}`);
+    const headers: Record<string, string> = {};
+    let status = 0;
+    let bodyText = '';
+    const req = { method: 'GET', headers: { host: 'forge.invalid' } };
+    const res = {
+      setHeader: (key: string, value: string) => { headers[key.toLowerCase()] = value; },
+      writeHead: (code: number) => { status = code; },
+      end: (chunk?: Buffer) => { bodyText = chunk === undefined ? '' : chunk.toString('utf8'); },
+    };
+    handleRest(forge, req as never, res as never, url, ['repos', 'adaiversen', 'history', 'commits'], null);
+    return { status, headers, body: JSON.parse(bodyText) as { sha: string }[] };
+  };
+  const shas: string[] = [];
+  let page = 1;
+  for (;;) {
+    assert.ok(page <= 4, 'rest commits pagination did not terminate');
+    const out = call(`per_page=2&page=${page}`);
+    assert.equal(out.status, 200);
+    for (const entry of out.body) shas.push(entry.sha);
+    if (out.body.length < 2) {
+      assert.equal(out.headers.link, undefined);
+      break;
+    }
+    assert.notEqual(out.headers.link, undefined);
+    page += 1;
+  }
+  assert.equal(shas.length, 5);
+  assert.deepEqual(new Set(shas), new Set(ids));
+  const past = call('per_page=2&page=99');
+  assert.deepEqual(past.body, []);
+  assert.equal(past.headers.link, undefined);
+  ok('rest commits pagination terminates; pages past the end are empty with no next link');
 }
 
 process.stdout.write(`\n${passed} tests passed\n`);

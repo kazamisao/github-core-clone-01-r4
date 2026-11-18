@@ -48,12 +48,19 @@ function decodeSegment(segment: string): string {
 
 export function createApp(): Server {
   const forge = new Forge();
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void dispatch(forge, req, res).catch((error: unknown) => {
       if (!res.headersSent) sendError(res, 500, error instanceof Error ? error.message : 'Internal error');
       else res.end();
     });
   });
+  // The benchmark client pools connections aggressively; a long keep-alive
+  // window and no per-socket request cap keep those sockets reusable for a
+  // whole workload instead of paying fresh handshakes mid-round.
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 130_000;
+  server.maxRequestsPerSocket = 0;
+  return server;
 }
 
 async function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
