@@ -4,6 +4,7 @@
 // served from a per-repo cache of serialized bodies that any mutation clears.
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Forge, ForgeError, type IssueRec, type PullRec, type RepoState } from './store.ts';
+import { parseTree } from './gitlib.ts';
 
 let requestSeq = 0;
 
@@ -174,6 +175,19 @@ function route(
     }
     return sendError(res, 404, 'Not Found');
   }
+  if (segments[0] === 'search' && segments[1] === 'issues' && segments.length === 2) {
+    if (method !== 'GET') return sendError(res, 404, 'Not Found');
+    const q = (url.searchParams.get('q') ?? '').toLowerCase();
+    const items: Record<string, unknown>[] = [];
+    for (const candidate of forge.reposOf(login)) {
+      for (const issue of candidate.issues) {
+        if (q === '' || issue.title.toLowerCase().includes(q) || issue.body.toLowerCase().includes(q)) {
+          items.push(issueJson(forge, candidate, issue));
+        }
+      }
+    }
+    return void sendJson(res, 200, { total_count: items.length, incomplete_results: false, items });
+  }
   if (segments[0] !== 'repos' || segments.length < 3) return sendError(res, 404, 'Not Found');
   const owner = segments[1]!;
   const name = segments[2]!;
@@ -189,13 +203,13 @@ function route(
     case 'contents':
       return contents(forge, res, repo, rest.slice(1).join('/'), url, body, method);
     case 'git':
-      return gitData(forge, res, repo, rest.slice(1), body, method);
+      return gitData(forge, res, repo, rest.slice(1), url, body, method);
     case 'labels':
       return labels(forge, res, repo, rest, body, method);
     case 'issues':
       return issues(forge, req, res, repo, rest, url, body, method);
     case 'pulls':
-      return pulls(forge, res, repo, rest, url, body, method);
+      return pulls(forge, req, res, repo, rest, url, body, method);
     default:
       return sendError(res, 404, 'Not Found');
   }
@@ -208,6 +222,9 @@ function repoRoot(forge: Forge, req: IncomingMessage, res: ServerResponse, repo:
     if (typeof body?.description === 'string') repo.description = body.description;
     if (typeof body?.private === 'boolean') repo.isPrivate = body.private;
     if (typeof body?.name === 'string' && body.name !== '' && body.name !== repo.name) {
+      if (forge.getRepo(repo.owner, body.name) !== undefined) {
+        throw new ForgeError(422, `A repository named ${body.name} already exists for ${repo.owner}`);
+      }
       forge.repos.delete(forge.repoKey(repo.owner, repo.name));
       repo.name = body.name;
       forge.repos.set(forge.repoKey(repo.owner, repo.name), repo);
@@ -250,8 +267,10 @@ function commits(forge: Forge, req: IncomingMessage, res: ServerResponse, repo: 
   const refish = url.searchParams.get('sha') ?? repo.defaultBranch;
   const tip = forge.resolveCommit(repo, refish);
   if (tip === undefined) return void sendJson(res, 200, []);
-  const all = forge.listCommits(repo, tip, 10000).map((oid) => commitJson(forge, repo, oid));
-  return void sendJson(res, 200, paginate(res, req, url, all, pageOf(url)));
+  // Page over the oid list first; only the served page pays for commitJson.
+  const all = forge.listCommits(repo, tip, 10000);
+  const slice = paginate(res, req, url, all, pageOf(url));
+  return void sendJson(res, 200, slice.map((oid) => commitJson(forge, repo, oid)));
 }
 
 function commitJson(forge: Forge, repo: RepoState, oid: string): Record<string, unknown> {
@@ -331,7 +350,7 @@ function contents(forge: Forge, res: ServerResponse, repo: RepoState, path: stri
   return sendError(res, 404, 'Not Found');
 }
 
-function gitData(forge: Forge, res: ServerResponse, repo: RepoState, rest: string[], body: Record<string, unknown> | null, method: string): void {
+function gitData(forge: Forge, res: ServerResponse, repo: RepoState, rest: string[], url: URL, body: Record<string, unknown> | null, method: string): void {
   if (rest[0] === 'refs' && rest.length === 1 && method === 'POST') {
     const ref = typeof body?.ref === 'string' ? body.ref : '';
     const sha = typeof body?.sha === 'string' ? body.sha : '';
@@ -350,9 +369,27 @@ function gitData(forge: Forge, res: ServerResponse, repo: RepoState, rest: strin
     return void sendJson(res, 200, { ref, object: { sha, type: 'commit' } });
   }
   if (rest[0] === 'trees' && rest.length === 2 && method === 'GET') {
-    const object = forge.getObject(repo, rest[1]!);
+    let treeOid = rest[1]!;
+    let object = forge.getObject(repo, treeOid);
+    if (object !== undefined && object.type === 'commit') {
+      const commit = forge.commitOf(repo, treeOid);
+      if (commit === undefined) return sendError(res, 404, 'Not Found');
+      treeOid = commit.tree;
+      object = forge.getObject(repo, treeOid);
+    }
     if (object === undefined || object.type !== 'tree') return sendError(res, 404, 'Not Found');
-    return void sendJson(res, 200, { sha: rest[1], tree: [] });
+    if (url.searchParams.get('recursive') === '1') {
+      const flat = forge.flattenTree(repo, treeOid);
+      const tree = [...flat.entries()].map(([path, entry]) => ({ path, mode: entry.mode, type: 'blob', sha: entry.oid }));
+      return void sendJson(res, 200, { sha: treeOid, tree, truncated: false });
+    }
+    const tree = parseTree(object.data).map((entry) => ({
+      path: entry.name,
+      mode: entry.mode,
+      type: entry.mode === '40000' ? 'tree' : 'blob',
+      sha: entry.oid,
+    }));
+    return void sendJson(res, 200, { sha: treeOid, tree, truncated: false });
   }
   return sendError(res, 404, 'Not Found');
 }
@@ -433,7 +470,7 @@ function issues(forge: Forge, req: IncomingMessage, res: ServerResponse, repo: R
   return sendError(res, 404, 'Not Found');
 }
 
-function pulls(forge: Forge, res: ServerResponse, repo: RepoState, rest: string[], url: URL, body: Record<string, unknown> | null, method: string): void {
+function pulls(forge: Forge, req: IncomingMessage, res: ServerResponse, repo: RepoState, rest: string[], url: URL, body: Record<string, unknown> | null, method: string): void {
   if (rest.length === 1) {
     if (method === 'POST') {
       const title = typeof body?.title === 'string' ? body.title : '';
@@ -451,7 +488,7 @@ function pulls(forge: Forge, res: ServerResponse, repo: RepoState, rest: string[
         .filter((pull) => state === 'all' || (state === 'closed' ? pull.state === 'closed' : pull.state === 'open'))
         .sort((a, b) => a.number - b.number)
         .map((pull) => pullJson(forge, repo, pull));
-      return void sendJson(res, 200, list);
+      return void sendJson(res, 200, paginate(res, req, url, list, pageOf(url)));
     }
     return sendError(res, 404, 'Not Found');
   }

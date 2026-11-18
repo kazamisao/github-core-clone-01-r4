@@ -21,15 +21,21 @@ const AGENT = 'agent=forge/1.0';
 // a pure function of the repository state, so identical requests (the clone
 // benchmark issues fifty of them) are served one assembled Buffer. The repo
 // version in every key invalidates on any mutation.
-const gitResponses = new WeakMap<RepoState, Map<string, Buffer>>();
+const gitResponses = new WeakMap<RepoState, { version: number; cache: Map<string, Buffer> }>();
 
 function gitCache(repo: RepoState): Map<string, Buffer> {
-  let cache = gitResponses.get(repo);
-  if (cache === undefined) {
-    cache = new Map();
-    gitResponses.set(repo, cache);
+  let entry = gitResponses.get(repo);
+  if (entry === undefined) {
+    entry = { version: repo.version, cache: new Map() };
+    gitResponses.set(repo, entry);
   }
-  return cache;
+  if (entry.version !== repo.version) {
+    // Keys embed the version, so a version change orphans every entry: drop
+    // them instead of holding pack-sized buffers for the whole trial.
+    entry.cache.clear();
+    entry.version = repo.version;
+  }
+  return entry.cache;
 }
 
 function headTarget(repo: RepoState): string {
@@ -401,6 +407,7 @@ export async function handleReceivePack(forge: Forge, res: ServerResponse, repo:
     let unpackOk = true;
     let unpackError = '';
     if (rest.length > 0) {
+      const sizeBefore = repo.objects.size;
       try {
         const objects = await parsePackAsync(rest, (oid) => forge.getObject(repo, oid));
         for (const object of objects) forge.putObject(repo, object.type, object.data);
@@ -408,6 +415,10 @@ export async function handleReceivePack(forge: Forge, res: ServerResponse, repo:
         unpackOk = false;
         unpackError = error instanceof Error ? error.message : 'unpack failed';
       }
+      // Objects land in the store before the ref updates are judged, and a
+      // rejected update must not leave them invisible to the version-keyed
+      // caches: any new object bumps the repo version like any mutation.
+      if (repo.objects.size > sizeBefore) forge.touch(repo);
     }
     const results: { ref: string; ok: boolean; reason: string }[] = [];
     for (const command of commands) {

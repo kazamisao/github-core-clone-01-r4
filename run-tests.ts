@@ -303,4 +303,66 @@ function chainForge(): { forge: Forge; ids: string[] } {
   ok('rest commits pagination terminates; pages past the end are empty with no next link');
 }
 
+// ---- review-gate regressions -------------------------------------------------
+{
+  // GraphQL edges: each edge carries its own cursor and its node directly —
+  // no double nesting, no shared cursor:0.
+  const forge = new Forge();
+  const repo = forge.createRepo('adaiversen', 'edges', false);
+  forge.createIssue(repo, { title: 'one', body: '' });
+  forge.createIssue(repo, { title: 'two', body: '' });
+  const out = executeGraphQL(forge, {
+    query: '{ repository(owner: "adaiversen", name: "edges") { issues(first: 2) { edges { cursor node { number } } } } }',
+  }) as { data: { repository: { issues: { edges: { cursor: string; node: { number: number; node?: unknown } }[] } } } };
+  const edges = out.data.repository.issues.edges;
+  assert.equal(edges.length, 2);
+  assert.equal(edges[0]!.node.number, 1);
+  assert.equal(edges[0]!.node.node, undefined);
+  assert.equal(Buffer.from(edges[0]!.cursor, 'base64').toString('utf8'), 'cursor:0');
+  assert.equal(Buffer.from(edges[1]!.cursor, 'base64').toString('utf8'), 'cursor:1');
+  ok('graphql edges carry per-edge cursors and unnested nodes');
+}
+{
+  // A cyclic fragment is a GraphQL error answer, never a stack overflow or
+  // a hang; a shared (DAG) fragment stays inside the same budget.
+  const forge = new Forge();
+  forge.createRepo('adaiversen', 'frag', false);
+  const cyclic = executeGraphQL(forge, {
+    query: '{ repository(owner: "adaiversen", name: "frag") { ...F } } fragment F on Repository { ...F }',
+  }) as { data: unknown; errors?: { message: string }[] };
+  assert.equal(cyclic.data, null);
+  assert.ok((cyclic.errors ?? []).length >= 1);
+  const fine = executeGraphQL(forge, {
+    query: '{ repository(owner: "adaiversen", name: "frag") { ...F } } fragment F on Repository { name }',
+  }) as { data: { repository: { name: string } } };
+  assert.equal(fine.data.repository.name, 'frag');
+  ok('cyclic graphql fragments error out instead of blowing the stack');
+}
+{
+  // REST git trees returns the tree's real entries, by tree sha and by
+  // commit sha alike — not an empty stub.
+  const forge = new Forge();
+  const repo = forge.createRepo('adaiversen', 'trees', false);
+  forge.writeFile(repo, 'main', 'hello.txt', Buffer.from('hello\n'), 'add hello');
+  const tip = forge.branchTip(repo, 'main')!;
+  const call = (sha: string): { status: number; body: { tree: { path: string; type: string }[] } } => {
+    const url = new URL(`http://forge.invalid/api/v3/repos/adaiversen/trees/git/trees/${sha}`);
+    let status = 0;
+    let bodyText = '';
+    const req = { method: 'GET', headers: { host: 'forge.invalid' } };
+    const res = {
+      setHeader: () => undefined,
+      writeHead: (code: number) => { status = code; },
+      end: (chunk?: Buffer) => { bodyText = chunk === undefined ? '' : chunk.toString('utf8'); },
+    };
+    handleRest(forge, req as never, res as never, url, ['repos', 'adaiversen', 'trees', 'git', 'trees', sha], null);
+    return { status, body: JSON.parse(bodyText) as { tree: { path: string; type: string }[] } };
+  };
+  const byCommit = call(tip);
+  assert.equal(byCommit.status, 200);
+  assert.deepEqual(byCommit.body.tree.map((entry) => entry.path), ['hello.txt']);
+  assert.equal(byCommit.body.tree[0]!.type, 'blob');
+  ok('rest git trees lists real entries by commit and tree sha');
+}
+
 process.stdout.write(`\n${passed} tests passed\n`);

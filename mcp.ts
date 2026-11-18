@@ -187,21 +187,67 @@ function callTool(forge: Forge, res: ServerResponse, id: unknown, name: string, 
   return rpcError(res, id, -32602, `Unknown tool: ${name}`);
 }
 
+/** A response sink that records instead of writing, so a batch element can be handled on its own. */
+function captureRes(): { res: ServerResponse; take: () => { status: number; body: Buffer } | null } {
+  let status = 0;
+  let body: Buffer | null = null;
+  const res = {
+    writeHead: (code: number) => { status = code; },
+    setHeader: () => undefined,
+    end: (chunk?: Buffer | string) => {
+      body = chunk === undefined ? Buffer.alloc(0) : typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
+    },
+  };
+  return {
+    res: res as unknown as ServerResponse,
+    take: () => (body === null ? null : { status, body }),
+  };
+}
+
 /** Handle one POST /mcp with an already-parsed JSON body. */
 export function handleMcp(forge: Forge, res: ServerResponse, body: unknown): void {
   if (Array.isArray(body)) {
-    // Batches are answered per element; this client never sends them.
-    const first = body[0] as Record<string, unknown> | undefined;
-    if (first === undefined) {
+    // A batch is answered per element: each element runs through the single
+    // request path against a captured response; notifications stay silent.
+    if (body.length === 0) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('[]');
       return;
     }
-    return handleMcp(forge, res, first);
+    const replies: unknown[] = [];
+    for (const element of body) {
+      const cap = captureRes();
+      handleMcp(forge, cap.res, element);
+      const got = cap.take();
+      if (got !== null && got.status !== 202 && got.body.length > 0) {
+        try {
+          replies.push(JSON.parse(got.body.toString('utf8')));
+        } catch {
+          // An element that produced no JSON leaves no reply.
+        }
+      }
+    }
+    if (replies.length === 0) {
+      res.writeHead(202, { 'content-type': 'application/json', 'content-length': 0 });
+      res.end();
+      return;
+    }
+    const out = Buffer.from(JSON.stringify(replies), 'utf8');
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': out.length });
+    res.end(out);
+    return;
   }
-  const request = (body ?? {}) as { id?: unknown; method?: string; params?: Record<string, unknown> };
+  if (body === null || typeof body !== 'object') {
+    return rpcError(res, null, -32600, 'Invalid Request');
+  }
+  const request = body as { id?: unknown; method?: string; params?: Record<string, unknown> };
   const id = request.id;
   const method = typeof request.method === 'string' ? request.method : '';
+  if (method === '') {
+    // No method names nothing callable: with an id it is an invalid request,
+    // and without one there is no notification to honor either.
+    return rpcError(res, id === undefined || id === null ? null : id, -32600, 'Invalid Request');
+  }
   if (id === undefined || id === null) {
     // A notification: accept and stay silent.
     res.writeHead(202, { 'content-type': 'application/json', 'content-length': 0 });

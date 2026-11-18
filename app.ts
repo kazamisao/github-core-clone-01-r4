@@ -10,13 +10,21 @@ import { handleMcp, handleMcpParseError } from './mcp.ts';
 
 const MAX_BODY = 256 * 1024 * 1024;
 
+let graphqlSeq = 0;
+
+/** The GraphQL surface answers with its own writeHead calls; it still owes every reply a request id. */
+function nextRequestId(): string {
+  graphqlSeq += 1;
+  return `G${graphqlSeq.toString(36).toUpperCase()}`;
+}
+
 function authorized(req: IncomingMessage): boolean {
   const header = req.headers.authorization;
   if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false;
   const token = header.slice('Bearer '.length);
   if (token === '') return false;
   const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  return expected === '' || token === expected;
+  return expected !== '' && token === expected;
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -113,13 +121,13 @@ async function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse)
     if (Array.isArray(parsed)) {
       const results = parsed.map((entry) => executeGraphQL(forge, entry as { query?: string; variables?: Record<string, unknown> }));
       const body = Buffer.from(JSON.stringify(results), 'utf8');
-      res.writeHead(200, { 'content-type': 'application/json', 'content-length': body.length });
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': body.length, 'x-github-request-id': nextRequestId() });
       res.end(body);
       return;
     }
     const result = executeGraphQL(forge, parsed as { query?: string; variables?: Record<string, unknown>; operationName?: string });
     const body = Buffer.from(JSON.stringify(result), 'utf8');
-    res.writeHead(200, { 'content-type': 'application/json', 'content-length': body.length });
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': body.length, 'x-github-request-id': nextRequestId() });
     res.end(body);
     return;
   }

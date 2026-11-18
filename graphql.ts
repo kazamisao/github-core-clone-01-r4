@@ -77,8 +77,14 @@ function tokenize(source: string): string[] {
       while (j < source.length && source[j] !== '"') {
         if (source[j] === '\\') {
           const esc = source[j + 1]!;
-          out += esc === 'n' ? '\n' : esc === 't' ? '\t' : esc === 'r' ? '\r' : esc;
-          j += 2;
+          if (esc === 'u') {
+            const code = Number.parseInt(source.slice(j + 2, j + 6), 16);
+            out += String.fromCharCode(Number.isNaN(code) ? 0 : code);
+            j += 6;
+          } else {
+            out += esc === 'n' ? '\n' : esc === 't' ? '\t' : esc === 'r' ? '\r' : esc === 'b' ? '\b' : esc === 'f' ? '\f' : esc;
+            j += 2;
+          }
         } else {
           out += source[j];
           j += 1;
@@ -252,6 +258,8 @@ interface ExecContext {
   variables: Record<string, unknown>;
   document: Document;
   errors: { message: string }[];
+  /** Fragment spreads executed so far; capped so cyclic or shared fragments cannot blow up. */
+  expansions: number;
 }
 
 function resolveValue(ctx: ExecContext, value: Value): unknown {
@@ -337,6 +345,7 @@ function connection<T>(items: T[], args: Record<string, unknown>, wrap: (item: T
   return {
     __type: 'Connection',
     nodes: slice.map(wrap),
+    cursors: slice.map((_, index) => cursorFor(start + index)),
     pageInfo: {
       __type: 'PageInfo',
       hasNextPage: hasNext,
@@ -396,6 +405,13 @@ function typeObject(name: string): GqlObject | null {
 function executeSelection(ctx: ExecContext, parent: GqlObject, selection: FieldNode[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const node of selection) {
+    if (node.fragment !== null || node.inlineType !== null) {
+      // Every spread re-executes its selection: a cyclic fragment would
+      // recurse forever and a shared one multiplies work exponentially, so
+      // spreads share one hard budget per request.
+      ctx.expansions += 1;
+      if (ctx.expansions > 250) throw new Error('Fragment expansion limit exceeded');
+    }
     if (node.fragment !== null) {
       const fragment = ctx.document.fragments.get(node.fragment);
       if (fragment !== undefined && (fragment.typeCondition === null || fragment.typeCondition === parent.__type)) {
@@ -616,7 +632,11 @@ function executeField(ctx: ExecContext, parent: GqlObject, node: FieldNode): unk
       if (name === 'totalCount') return parent.totalCount;
       if (name === 'edges') {
         const nodes = parent.nodes as GqlObject[];
-        return nodes.map((entry) => ({ node: node.selection === null ? entry : executeSelection(ctx, { __type: 'Edge', node: entry }, node.selection) }));
+        const cursors = parent.cursors as string[];
+        return nodes.map((entry, index) => {
+          const edge: GqlObject = { __type: 'Edge', node: entry, cursor: cursors[index] ?? cursorFor(0) };
+          return node.selection === null ? { node: entry, cursor: edge.cursor } : executeSelection(ctx, edge, node.selection);
+        });
       }
       break;
     }
@@ -625,7 +645,7 @@ function executeField(ctx: ExecContext, parent: GqlObject, node: FieldNode): unk
         const inner = parent.node as GqlObject;
         return node.selection === null ? inner : executeSelection(ctx, inner, node.selection);
       }
-      if (name === 'cursor') return cursorFor(0);
+      if (name === 'cursor') return parent.cursor;
       break;
     }
     case 'PageInfo': {
@@ -813,9 +833,17 @@ export function executeGraphQL(forge: Forge, body: { query?: string; variables?:
   const operation = body.operationName !== undefined
     ? document.operations.find((candidate) => candidate.name === body.operationName) ?? document.operations[0]!
     : document.operations[0]!;
-  const ctx: ExecContext = { forge, variables: body.variables ?? {}, document, errors: [] };
+  const ctx: ExecContext = { forge, variables: body.variables ?? {}, document, errors: [], expansions: 0 };
   const root: GqlObject = { __type: operation.kind === 'mutation' ? 'Mutation' : 'Query' };
-  const data = executeSelection(ctx, root, operation.selection);
+  let data: Record<string, unknown> | null;
+  try {
+    data = executeSelection(ctx, root, operation.selection);
+  } catch (error) {
+    // An execution blow-up (for example a fragment cycle past its budget)
+    // is a GraphQL error answer, never an exception out of the executor.
+    ctx.errors.push({ message: error instanceof Error ? error.message : 'Execution error' });
+    data = null;
+  }
   const out: Record<string, unknown> = { data };
   if (ctx.errors.length > 0) out.errors = ctx.errors;
   return out;

@@ -144,6 +144,7 @@ export class Forge {
 
   touch(repo: RepoState): void {
     repo.version += 1;
+    repo.packCache.clear();
     repo.responseCache.clear();
   }
 
