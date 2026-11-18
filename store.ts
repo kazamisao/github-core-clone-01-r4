@@ -70,7 +70,7 @@ export interface RepoState {
   nextCommentId: number;
   version: number;
   responseCache: Map<string, Buffer>;
-  packCache: Map<string, Buffer>;
+  packCache: Map<string, { pack: Buffer; shallow: string[]; unshallow: string[] }>;
 }
 
 export class ForgeError extends Error {
@@ -579,6 +579,29 @@ export class Forge {
     const haveObjects = new Set<string>();
     for (const oid of haveCommits) this.collectTreeClosure(repo, oid, haveObjects);
 
+    // Peel tag wants: the tag object itself ships, and its target commit is
+    // selected like any other want.
+    const tagObjects = new Set<string>();
+    const effectiveWants: string[] = [];
+    for (const want of wants) {
+      let current = want;
+      let guard = 0;
+      for (;;) {
+        guard += 1;
+        if (guard > 10) break;
+        const object = repo.objects.get(current);
+        if (object === undefined || object.type !== 'tag') break;
+        tagObjects.add(current);
+        const target = this.resolveCommit(repo, current);
+        if (target === undefined || target === current) break;
+        current = target;
+      }
+      effectiveWants.push(current);
+    }
+    // A `deepen` with no client shallow boundary is an initial depth (that
+    // is how protocol v2 asks for a shallow clone); with one, it is relative.
+    const initialDepth = options.depth ?? (options.deepen !== undefined && clientShallow.size === 0 ? options.deepen : undefined);
+
     const included = new Set<string>();
     if (options.deepen !== undefined && clientShallow.size > 0) {
       // Budgeted walk: entering a commit the client already holds as shallow
@@ -586,7 +609,7 @@ export class Forge {
       // first); each step to a parent spends one.
       const budget = new Map<string, number>();
       const queue: { oid: string; left: number }[] = [];
-      for (const want of wants) queue.push({ oid: want, left: Number.POSITIVE_INFINITY });
+      for (const want of effectiveWants) queue.push({ oid: want, left: Number.POSITIVE_INFINITY });
       let head = 0;
       let guard = 0;
       while (head < queue.length) {
@@ -605,14 +628,14 @@ export class Forge {
         included.add(oid);
         for (const parent of commit.parents) queue.push({ oid: parent, left: allowance - 1 });
       }
-    } else if (options.depth !== undefined) {
+    } else if (initialDepth !== undefined) {
       const generation = new Map<string, number>();
-      const queue: { oid: string; gen: number }[] = wants.map((oid) => ({ oid, gen: 1 }));
+      const queue: { oid: string; gen: number }[] = effectiveWants.map((oid) => ({ oid, gen: 1 }));
       let head = 0;
       while (head < queue.length) {
         const { oid, gen } = queue[head]!;
         head += 1;
-        if (gen > options.depth) continue;
+        if (gen > initialDepth) continue;
         const known = generation.get(oid);
         if (known !== undefined && known <= gen) continue;
         generation.set(oid, gen);
@@ -623,7 +646,7 @@ export class Forge {
       }
     } else if (options.deepenSince !== undefined) {
       const seen = new Set<string>();
-      const queue = [...wants];
+      const queue = [...effectiveWants];
       let head = 0;
       while (head < queue.length) {
         const oid = queue[head]!;
@@ -638,7 +661,7 @@ export class Forge {
         for (const parent of commit.parents) queue.push(parent);
       }
     } else {
-      for (const want of wants) {
+      for (const want of effectiveWants) {
         for (const oid of this.ancestors(repo, want)) included.add(oid);
       }
     }
@@ -646,6 +669,11 @@ export class Forge {
     for (const oid of clientShallow) included.delete(oid);
 
     const objects = new Map<string, GitObject>();
+    for (const tagOid of tagObjects) {
+      if (haveObjects.has(tagOid)) continue;
+      const object = repo.objects.get(tagOid);
+      if (object !== undefined) objects.set(tagOid, object);
+    }
     for (const oid of included) {
       const closure = new Set<string>();
       this.collectTreeClosure(repo, oid, closure);

@@ -2,7 +2,7 @@
 // build/parse (plain objects plus ofs/ref delta application), commit and tree
 // codecs. Pure functions over Buffers; no state lives here.
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { createInflate, deflateSync, inflateSync } from 'node:zlib';
 
 export type ObjectType = 'blob' | 'tree' | 'commit' | 'tag';
 export const TYPE_CODES: Record<ObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
@@ -167,6 +167,8 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
  * optional base lookup. Entry boundaries are found by binary search: zlib's
  * inflate ignores trailing bytes but throws on a truncated stream, so the
  * minimal prefix that inflates is exactly the entry's compressed length.
+ * Kept for tests and small ad-hoc packs; the receive path uses the faster
+ * streaming parser below.
  */
 export function parsePack(pack: Buffer, lookup?: (oid: string) => { type: ObjectType; data: Buffer } | undefined): PackObject[] {
   if (pack.length < 12 + 20) throw new Error('pack too short');
@@ -178,10 +180,15 @@ export function parsePack(pack: Buffer, lookup?: (oid: string) => { type: Object
   const digest = createHash('sha1').update(pack.subarray(0, pack.length - 20)).digest();
   if (!digest.equals(trailer)) throw new Error('pack checksum mismatch');
   const end = pack.length - 20;
-  const inflateEntry = (from: number, expectedSize: number): { data: Buffer; next: number } => {
-    let lo = 1;
-    let hi = end - from;
-    if (hi < 1) throw new Error('pack entry truncated');
+  const inflateEntry = (from: number, expectedSize: number, isLast: boolean): { data: Buffer; next: number } => {
+    if (isLast) {
+      const out = inflateSync(pack.subarray(from, end));
+      if (out.length !== expectedSize) throw new Error('pack object size mismatch');
+      return { data: out, next: end };
+    }
+    // Exponential growth to an upper bound, then a binary search inside the
+    // last interval: failed attempts inflate only partial streams, so the
+    // total work stays close to two full inflates per entry.
     const attempt = (length: number): Buffer | null => {
       try {
         const out = inflateSync(pack.subarray(from, from + length));
@@ -190,6 +197,15 @@ export function parsePack(pack: Buffer, lookup?: (oid: string) => { type: Object
         return null;
       }
     };
+    let lo = 1;
+    let hi = Math.min(end - from, 256);
+    let found = attempt(hi);
+    while (found === null && hi < end - from) {
+      lo = hi + 1;
+      hi = Math.min(end - from, hi * 2);
+      found = attempt(hi);
+    }
+    if (found === null) throw new Error('pack entry does not inflate');
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
       if (attempt(mid) !== null) hi = mid;
@@ -199,15 +215,7 @@ export function parsePack(pack: Buffer, lookup?: (oid: string) => { type: Object
     if (data === null) throw new Error('pack entry does not inflate');
     return { data, next: from + lo };
   };
-  interface RawEntry {
-    type: ObjectType | 'ofs' | 'ref';
-    data: Buffer;
-    offset: number;
-    baseOffset: number;
-    baseRef: string;
-  }
   const raw: RawEntry[] = [];
-  const byOffset = new Map<number, PackObject>();
   let pos = 12;
   for (let index = 0; index < count; index += 1) {
     const start = pos;
@@ -252,10 +260,24 @@ export function parsePack(pack: Buffer, lookup?: (oid: string) => { type: Object
       if (type === undefined) throw new Error(`pack object type ${typeCode} unknown`);
       kind = type;
     }
-    const { data, next } = inflateEntry(pos, size);
+    const { data, next } = inflateEntry(pos, size, index === count - 1);
     pos = next;
     raw.push({ type: kind, data, offset: start, baseOffset, baseRef });
   }
+  return resolveRaw(raw, lookup);
+}
+
+interface RawEntry {
+  type: ObjectType | 'ofs' | 'ref';
+  data: Buffer;
+  offset: number;
+  baseOffset: number;
+  baseRef: string;
+}
+
+/** Resolve delta entries (in any order) into whole objects. */
+function resolveRaw(raw: RawEntry[], lookup?: (oid: string) => { type: ObjectType; data: Buffer } | undefined): PackObject[] {
+  const byOffset = new Map<number, PackObject>();
   const resolve = (entry: RawEntry, depth: number): PackObject => {
     if (depth > 100) throw new Error('delta chain too deep');
     if (entry.type !== 'ofs' && entry.type !== 'ref') {
@@ -285,6 +307,87 @@ export function parsePack(pack: Buffer, lookup?: (oid: string) => { type: Object
     return done;
   };
   return raw.map((entry) => resolve(entry, 0));
+}
+
+/** Inflate exactly one zlib stream; resolves with its bytes and consumption. */
+function inflateOne(buf: Buffer): Promise<{ data: Buffer; consumed: number }> {
+  return new Promise((resolve, reject) => {
+    const stream = createInflate();
+    const chunks: Buffer[] = [];
+    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+    stream.on('end', () => resolve({ data: Buffer.concat(chunks), consumed: stream.bytesWritten }));
+    stream.on('error', reject);
+    stream.end(buf);
+  });
+}
+
+/**
+ * The streaming pack parser the receive path uses: one Inflate stream per
+ * entry reports exactly how many compressed bytes it consumed, which is
+ * several times faster than searching for boundaries with repeated sync
+ * inflates.
+ */
+export async function parsePackAsync(pack: Buffer, lookup?: (oid: string) => { type: ObjectType; data: Buffer } | undefined): Promise<PackObject[]> {
+  if (pack.length < 12 + 20) throw new Error('pack too short');
+  if (pack.toString('latin1', 0, 4) !== 'PACK') throw new Error('pack signature missing');
+  const version = pack.readUInt32BE(4);
+  if (version !== 2 && version !== 3) throw new Error(`pack version ${version} unsupported`);
+  const count = pack.readUInt32BE(8);
+  const trailer = pack.subarray(pack.length - 20);
+  const digest = createHash('sha1').update(pack.subarray(0, pack.length - 20)).digest();
+  if (!digest.equals(trailer)) throw new Error('pack checksum mismatch');
+  const end = pack.length - 20;
+  const raw: RawEntry[] = [];
+  let pos = 12;
+  for (let index = 0; index < count; index += 1) {
+    const start = pos;
+    if (pos >= end) throw new Error('pack entry truncated');
+    let byte = pack[pos]!;
+    pos += 1;
+    const typeCode = (byte >> 4) & 0x07;
+    let size = byte & 0x0f;
+    let shift = 4;
+    let guard = 0;
+    while (byte & 0x80) {
+      guard += 1;
+      if (guard > 10) throw new Error('pack entry header runaway');
+      byte = pack[pos]!;
+      pos += 1;
+      size += (byte & 0x7f) * 2 ** shift;
+      shift += 7;
+    }
+    let baseOffset = -1;
+    let baseRef = '';
+    let kind: RawEntry['type'];
+    if (typeCode === 6) {
+      let back = pack[pos]!;
+      pos += 1;
+      let value = back & 0x7f;
+      guard = 0;
+      while (back & 0x80) {
+        guard += 1;
+        if (guard > 10) throw new Error('ofs-delta header runaway');
+        back = pack[pos]!;
+        pos += 1;
+        value = ((value + 1) << 7) | (back & 0x7f);
+      }
+      baseOffset = start - value;
+      kind = 'ofs';
+    } else if (typeCode === 7) {
+      baseRef = pack.toString('hex', pos, pos + 20);
+      pos += 20;
+      kind = 'ref';
+    } else {
+      const type = CODE_TYPES[typeCode];
+      if (type === undefined) throw new Error(`pack object type ${typeCode} unknown`);
+      kind = type;
+    }
+    const { data, consumed } = await inflateOne(pack.subarray(pos, end));
+    if (data.length !== size) throw new Error('pack object size mismatch');
+    pos += consumed;
+    raw.push({ type: kind, data, offset: start, baseOffset, baseRef });
+  }
+  return resolveRaw(raw, lookup);
 }
 
 // ------------------------------------------------------------------ commits
